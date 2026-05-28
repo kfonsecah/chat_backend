@@ -6,20 +6,13 @@ WS /ws/{token}
 Protocolo (todos los mensajes son JSON):
 
 Cliente → Servidor:
-  { "type": "group_message", "content": "...", "ttl": 30, "allow_read_receipt": true }
-  { "type": "dm", "to": "<user_id>", "content": "...", "ttl": 60, "allow_read_receipt": false }
-  { "type": "mark_read", "message_id": "<id>" }
+  { "type": "group_message", "content": "..." }
+  { "type": "dm", "to": "<user_id>", "content": "..." }
   { "type": "ping" }
-
-  Campos opcionales:
-    ttl              — segundos hasta que el mensaje expire y se elimine (omitir = permanente)
-    allow_read_receipt — si false, nadie notifica al remitente cuando lee (default: true)
 
 Servidor → Cliente:
   { "type": "group_message", "message": { ...ChatMessage } }
   { "type": "dm", "message": { ...ChatMessage } }
-  { "type": "message_seen", "message_id": "...", "seen_by": "<user_id>", "seen_at": "..." }
-  { "type": "message_expired", "message_id": "..." }
   { "type": "user_joined", "user": { ...ChatUser } }
   { "type": "user_left", "user_id": "..." }
   { "type": "users_list", "users": [ ...ChatUser ] }
@@ -29,7 +22,7 @@ Servidor → Cliente:
 """
 
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
@@ -42,25 +35,6 @@ router = APIRouter()
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _parse_ttl(value) -> int | None:
-    """Valida y retorna el TTL en segundos (1–86400), o None si no aplica."""
-    if value is None:
-        return None
-    try:
-        ttl = int(value)
-        if 1 <= ttl <= 86400:
-            return ttl
-    except (TypeError, ValueError):
-        pass
-    return None
-
-
-def _expires_iso(ttl: int | None) -> str | None:
-    if ttl is None:
-        return None
-    return (datetime.now(timezone.utc) + timedelta(seconds=ttl)).isoformat()
 
 
 async def _handle_message(
@@ -83,16 +57,6 @@ async def _handle_message(
             await manager.send_to(user_id, {"type": "error", "message": "El mensaje es demasiado largo (máx 1000 caracteres)."})
             return
 
-        raw_ttl = data.get("ttl")
-        ttl = _parse_ttl(raw_ttl)
-        if raw_ttl is not None and ttl is None:
-            await manager.send_to(user_id, {"type": "error", "message": "ttl inválido: debe ser un entero entre 1 y 86400."})
-            return
-        allow_read_receipt = data.get("allow_read_receipt", True)
-        if not isinstance(allow_read_receipt, bool):
-            allow_read_receipt = True
-        expires_at = _expires_iso(ttl)
-
         msg = ChatMessage(
             id=str(uuid.uuid4()),
             sender_id=user_id,
@@ -101,16 +65,12 @@ async def _handle_message(
             type="group",
             recipient_id=None,
             timestamp=_now_iso(),
-            ttl=ttl,
-            expires_at=expires_at,
-            allow_read_receipt=allow_read_receipt,
         )
         manager.save_group_message(msg)
         await manager.broadcast({
             "type": "group_message",
             "message": msg.model_dump(),
         })
-        await manager.schedule_expiry(msg)
 
     # ── Mensaje privado (DM) ──────────────────────────────────────────────────
     elif msg_type == "dm":
@@ -137,16 +97,6 @@ async def _handle_message(
             await manager.send_to(user_id, {"type": "error", "message": "El mensaje es demasiado largo (máx 1000 caracteres)."})
             return
 
-        raw_ttl = data.get("ttl")
-        ttl = _parse_ttl(raw_ttl)
-        if raw_ttl is not None and ttl is None:
-            await manager.send_to(user_id, {"type": "error", "message": "ttl inválido: debe ser un entero entre 1 y 86400."})
-            return
-        allow_read_receipt = data.get("allow_read_receipt", True)
-        if not isinstance(allow_read_receipt, bool):
-            allow_read_receipt = True
-        expires_at = _expires_iso(ttl)
-
         msg = ChatMessage(
             id=str(uuid.uuid4()),
             sender_id=user_id,
@@ -155,9 +105,6 @@ async def _handle_message(
             type="dm",
             recipient_id=to_id,
             timestamp=_now_iso(),
-            ttl=ttl,
-            expires_at=expires_at,
-            allow_read_receipt=allow_read_receipt,
         )
         manager.save_dm_message(msg)
 
@@ -165,23 +112,6 @@ async def _handle_message(
         payload = {"type": "dm", "message": msg.model_dump()}
         await manager.send_to(to_id, payload)
         await manager.send_to(user_id, payload)
-        await manager.schedule_expiry(msg)
-
-    # ── Marcar mensaje como leído ─────────────────────────────────────────────
-    elif msg_type == "mark_read":
-        message_id = str(data.get("message_id", "")).strip()
-        if not message_id:
-            await manager.send_to(user_id, {"type": "error", "message": "Debes especificar 'message_id'."})
-            return
-
-        receipt = manager.record_read(message_id, user_id)
-        if receipt:
-            await manager.send_to(receipt["sender_id"], {
-                "type": "message_seen",
-                "message_id": message_id,
-                "seen_by": receipt["seen_by"],
-                "seen_at": receipt["seen_at"],
-            })
 
     # ── Ping ──────────────────────────────────────────────────────────────────
     elif msg_type == "ping":

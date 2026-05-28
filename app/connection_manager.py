@@ -1,6 +1,5 @@
 
 
-import asyncio
 import base64
 import uuid
 from datetime import datetime, timezone
@@ -29,12 +28,6 @@ class ConnectionManager:
 
         # Historial de DMs: frozenset({uid_a, uid_b}) → lista de mensajes
         self.dm_history: dict[frozenset, list[ChatMessage]] = {}
-
-        # Vistos: message_id → lista de {"user_id": ..., "seen_at": ...}
-        self.read_receipts: dict[str, list[dict]] = {}
-
-        # Tareas de expiración pendientes: message_id → asyncio.Task
-        self._expiry_tasks: dict[str, asyncio.Task] = {}
 
     # ── Tokens ───────────────────────────────────────────────────────────────
 
@@ -151,60 +144,3 @@ class ConnectionManager:
 
     def get_user(self, user_id: str) -> Optional[ChatUser]:
         return self.registered_users.get(user_id)
-
-    # ── Vistos (read receipts) ────────────────────────────────────────────────
-
-    def get_message_by_id(self, message_id: str) -> Optional[ChatMessage]:
-        for msg in self.group_messages:
-            if msg.id == message_id:
-                return msg
-        for history in self.dm_history.values():
-            for msg in history:
-                if msg.id == message_id:
-                    return msg
-        return None
-
-    def record_read(self, message_id: str, reader_id: str) -> Optional[dict]:
-        """
-        Registra que reader_id leyó el mensaje.
-        Retorna {"seen_by": ..., "seen_at": ..., "sender_id": ...} si procede,
-        o None si el mensaje no existe, no permite receipt, o ya fue registrado.
-        """
-        msg = self.get_message_by_id(message_id)
-        if not msg or not msg.allow_read_receipt:
-            return None
-        # El remitente no se marca como lector de su propio mensaje
-        if msg.sender_id == reader_id:
-            return None
-        receipts = self.read_receipts.setdefault(message_id, [])
-        if any(r["user_id"] == reader_id for r in receipts):
-            return None
-        seen_at = datetime.now(timezone.utc).isoformat()
-        receipts.append({"user_id": reader_id, "seen_at": seen_at})
-        return {"seen_by": reader_id, "seen_at": seen_at, "sender_id": msg.sender_id}
-
-    # ── Mensajes temporales ───────────────────────────────────────────────────
-
-    async def schedule_expiry(self, msg: ChatMessage) -> None:
-        """Programa la expiración de un mensaje con TTL."""
-        if msg.ttl is None:
-            return
-        task = asyncio.create_task(self._expire_message(msg))
-        self._expiry_tasks[msg.id] = task
-
-    async def _expire_message(self, msg: ChatMessage) -> None:
-        await asyncio.sleep(msg.ttl)
-        expired_payload = {"type": "message_expired", "message_id": msg.id}
-
-        if msg.type == "group":
-            self.group_messages = [m for m in self.group_messages if m.id != msg.id]
-            await self.broadcast(expired_payload)
-        elif msg.type == "dm" and msg.recipient_id:
-            key = frozenset({msg.sender_id, msg.recipient_id})
-            if key in self.dm_history:
-                self.dm_history[key] = [m for m in self.dm_history[key] if m.id != msg.id]
-            await self.send_to(msg.sender_id, expired_payload)
-            await self.send_to(msg.recipient_id, expired_payload)
-
-        self.read_receipts.pop(msg.id, None)
-        self._expiry_tasks.pop(msg.id, None)
